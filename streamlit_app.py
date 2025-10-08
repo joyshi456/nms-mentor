@@ -1,6 +1,8 @@
 import streamlit as st
 from datetime import datetime
 from pathlib import Path
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="The Magic Split", layout="centered")
 
@@ -16,15 +18,49 @@ if "completed_subproblems" not in st.session_state:
 if "student_name" not in st.session_state:
     st.session_state.student_name = ""
 
-# --- TXT logging ---
+# --- Logging Setup ---
 DATA_DIR = Path("./.lesson_log")
 DATA_DIR.mkdir(exist_ok=True)
 LOG_FILE = DATA_DIR / "submissions.txt"
 
+# Google Sheets setup
+def get_google_sheet():
+    """Connect to Google Sheets if credentials are available."""
+    try:
+        # Check if running on Streamlit Cloud with secrets
+        if "gcp_service_account" in st.secrets:
+            credentials = Credentials.from_service_account_info(
+                st.secrets["gcp_service_account"],
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"
+                ]
+            )
+            client = gspread.authorize(credentials)
+            sheet_url = st.secrets.get("sheet_url", "")
+            if sheet_url:
+                return client.open_by_url(sheet_url).sheet1
+        return None
+    except Exception as e:
+        st.error(f"Google Sheets connection error: {e}")
+        return None
+
 def log_line(name: str, pid: str, answer: str):
+    """Log answer to both local file and Google Sheets (if available)."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Always log locally
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"{ts}\t{name.strip()}\t{pid}\t{answer.strip()}\n")
+
+    # Try to log to Google Sheets
+    try:
+        sheet = get_google_sheet()
+        if sheet:
+            sheet.append_row([ts, name.strip(), pid, answer.strip()])
+    except Exception as e:
+        # Silently fail - local logging still works
+        pass
 
 # --- Problem Definitions ---
 MODULES = [
@@ -57,11 +93,11 @@ Can this sentence be clearly identified as true or false?
 
 **Original Statement:** "All Pokémon in Generation 1 are from the Kanto region."
 
-The negation (opposite) of "All X are Y" is "Not all X are Y."
+The negation (opposite) of "All X are Y" is "Not all X are Y" or "At least one X is not Y."
                 """,
                 "prompt": "Write the negation of this statement.",
-                "expected_keywords": ["not all", "some", "negation"],
-                "hint": "Start with 'Not all Pokémon in Generation 1...'"
+                "expected_keywords": ["not all", "some", "at least one", "not", "kanto"],
+                "hint": "You can write: 'Not all Pokémon in Generation 1...' or 'At least one Pokémon in Generation 1 is not...'"
             },
             {
                 "id": "conditionals",
@@ -88,7 +124,7 @@ Think about what you know about Charizard's type.
 The converse switches the if and then parts.
                 """,
                 "prompt": "Write the converse of this statement.",
-                "expected_keywords": ["converse", "if", "then", "water", "surf"],
+                "expected_keywords": ["if", "water", "surf", "learn", "knows"],
                 "hint": "Switch the parts: 'If a Pokémon can learn Water-type moves, then...'"
             },
             {
@@ -103,7 +139,7 @@ The contrapositive negates both parts AND switches them:
 "If [NOT conclusion], then [NOT hypothesis]."
                 """,
                 "prompt": "Write the contrapositive of this statement.",
-                "expected_keywords": ["contrapositive", "not", "legendary", "high", "stats"],
+                "expected_keywords": ["if", "not", "legendary", "stats", "does not"],
                 "hint": "Start with: 'If a Pokémon does not have high base stats, then...'"
             }
         ]
@@ -168,7 +204,7 @@ Here's the clever solution:
 **Why 12 pennies in Pile A?** Because there are 12 total heads on the table!
                 """,
                 "prompt": "After following these steps, how many heads will be in each pile?",
-                "expected_keywords": ["equal", "same", "12", "twelve"],
+                "expected_keywords": ["equal", "same", "head", "pile", "both"],
                 "hint": "Think about what happens when you flip all the pennies in Pile A."
             },
             {
@@ -218,7 +254,7 @@ This works for any number of pennies and heads!
 - Both have the same number!
                 """,
                 "prompt": "Why does putting exactly H pennies in Pile A (where H = total heads) guarantee success?",
-                "expected_keywords": ["flip", "complement", "remaining", "equal"],
+                "expected_keywords": ["flip", "equal", "head", "pile", "same"],
                 "hint": "Flipping creates a 'complement' that matches the remaining heads."
             }
         ]
@@ -244,7 +280,7 @@ From the coin trick, we discovered this statement:
 - **Contrapositive:** Negate both parts and switch them
                 """,
                 "prompt": "Write the converse and contrapositive of the coin statement.",
-                "expected_keywords": ["converse", "contrapositive", "if", "then", "not", "equal"],
+                "expected_keywords": ["if", "then", "equal", "head", "flip"],
                 "hint": "Converse: 'If both piles have equal heads, then...' Contrapositive: 'If piles don't have equal heads, then...'"
             }
         ]
@@ -295,7 +331,7 @@ Imagine explaining the coin trick to a 5th grader who loves magic tricks but doe
 **Think about:** If a knight starts on white and makes 1 move, where is it? What about 3 moves? 5 moves?
                 """,
                 "prompt": "Explain why a knight cannot return to its starting square in an odd number of moves.",
-                "expected_keywords": ["impossible", "odd", "color", "changes", "white", "black"],
+                "expected_keywords": ["odd", "color", "change", "opposite", "different"],
                 "hint": "After an odd number of moves, the knight is on the opposite color from where it started."
             }
         ]
@@ -306,15 +342,16 @@ Imagine explaining the coin trick to a 5th grader who loves magic tricks but doe
 def check_answer(module_idx, subproblem_idx, answer):
     if not answer.strip():
         return False, "Please provide an answer."
-    
+
     answer_lower = answer.lower()
     module = MODULES[module_idx]
     subproblem = module["subproblems"][subproblem_idx]
-    
+
     # Check if answer contains expected keywords
     keyword_count = sum(1 for keyword in subproblem["expected_keywords"] if keyword in answer_lower)
-    
-    if keyword_count >= 2:  # At least 2 relevant keywords
+
+    # More flexible validation - at least 1 keyword and answer is substantial (>10 chars)
+    if keyword_count >= 1 and len(answer.strip()) > 10:
         return True, "Great work! You can proceed to the next problem."
     else:
         return False, f"Try again! Hint: {subproblem['hint']}"
@@ -331,30 +368,8 @@ def get_completed_subproblems():
     return total
 
 def is_current_subproblem_available():
-    module_idx = st.session_state.current_module
-    subproblem_idx = st.session_state.current_subproblem
-
-    # First subproblem of first module is always available
-    if module_idx == 0 and subproblem_idx == 0:
-        return True
-
-    # Check if previous subproblem is completed
-    if subproblem_idx > 0:
-        # Check if previous subproblem in same module is completed
-        if module_idx in st.session_state.completed_subproblems:
-            return (subproblem_idx - 1) in st.session_state.completed_subproblems[module_idx]
-        return False
-    else:
-        # First subproblem of a new module - check if previous module is completed
-        prev_module_idx = module_idx - 1
-        if prev_module_idx < 0:
-            return True
-
-        # Check if all subproblems in previous module are completed
-        if prev_module_idx in st.session_state.completed_subproblems:
-            prev_module = MODULES[prev_module_idx]
-            return len(st.session_state.completed_subproblems[prev_module_idx]) == len(prev_module["subproblems"])
-        return False
+    # TESTING MODE: All modules unlocked
+    return True
 
 # --- Main App ---
 st.title("🎯 The Magic Split")
@@ -501,23 +516,8 @@ for module_idx, module in enumerate(MODULES):
                 
                 button_text = f"{status} {sub_idx + 1}.{sub_idx + 1}"
 
-                # Check if this subproblem is available
-                is_available = False
-                if module_idx == 0 and sub_idx == 0:
-                    is_available = True
-                elif sub_idx > 0:
-                    if module_idx in st.session_state.completed_subproblems:
-                        is_available = (sub_idx - 1) in st.session_state.completed_subproblems[module_idx]
-                else:
-                    prev_module_idx = module_idx - 1
-                    if prev_module_idx >= 0:
-                        if prev_module_idx in st.session_state.completed_subproblems:
-                            prev_module = MODULES[prev_module_idx]
-                            is_available = len(st.session_state.completed_subproblems[prev_module_idx]) == len(prev_module["subproblems"])
-                    else:
-                        is_available = True
-
-                if st.button(button_text, key=f"nav_{module_idx}_{sub_idx}", disabled=not (is_available or is_completed)):
+                # TESTING MODE: All problems available
+                if st.button(button_text, key=f"nav_{module_idx}_{sub_idx}"):
                     st.session_state.current_module = module_idx
                     st.session_state.current_subproblem = sub_idx
                     st.rerun()
