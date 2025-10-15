@@ -1,6 +1,11 @@
 # Lesson logs and student data
 .lesson_log/
 
+# Secrets and credentials
+.streamlit/secrets.toml
+*.json
+!package.json
+
 # Python
 __pycache__/
 *.py[cod]
